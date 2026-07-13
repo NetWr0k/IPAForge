@@ -1,95 +1,249 @@
-## How ipaopt Works 
+# ipaopt Architecture Overview
+
+## Overview
+
+Apple's asset catalog pipeline is fundamentally **one way**.
+
+Raw `.xcassets` directories are compiled by Xcode (`actool`) into a binary `Assets.car` archive.
+
+```text
+┌──────────────────────┐
+│ Raw .xcassets Source │
+└──────────┬───────────┘
+           │
+           │ Xcode / actool
+           ▼
+┌──────────────────────┐
+│   Compiled Assets.car│
+└──────────────────────┘
+```
+
+Once compiled, an `Assets.car` file becomes an optimized binary blob.
+
+It **cannot** be selectively edited, pruned, or rebuilt without returning to the original asset catalog.
+
+Because of this limitation, **ipaopt** operates at two different stages of the build pipeline depending on what you're trying to optimize.
 
 ---
 
-##  Architectural Overview
+# Mode 1 — `ipaopt strip`
 
-Apple's asset catalog pipeline is a one-way system. Once raw `.xcassets` source folders are compiled into a binary `Assets.car` file, they become an opaque, optimized image blob.
+**Target:** Already-built `.ipa` files
+
+This mode performs post-build optimization by removing unused loose resources and thinning Mach-O binaries.
+
+> **Note:** `Assets.car` is left untouched because compiled asset catalogs cannot be modified.
+
+---
+
+## Processing Pipeline
 
 ```text
-  [ Raw Source Assets ] ───( Xcode / actool )───► [ Compiled Assets.car ]
-  (Editable Json/PNGs)                              (Opaque Binary Blob)
-                                                             │
-                                                    ❌ CANNOT SELECTIVELY
-                                                       DELETE FROM CAR
-Because Assets.car files cannot be mutated after compilation, ipaopt intercepts the pipeline at two completely different stages depending on your needs.
+                 Target .ipa
+                     │
+                     ▼
+        Extract Application Bundle
+                     │
+        ┌────────────┴────────────┐
+        ▼                         ▼
+ Loose Bundle Resources      Mach-O Binaries
+        │                         │
+        ▼                         ▼
+ Match Removal Rules       Thin CPU Architectures
+        │                  (using lipo)
+        ▼                         ▼
+ Delete Matching Files     Replace Fat Binary
+        └────────────┬────────────┘
+                     ▼
+              Repackage IPA
+                     │
+                     ▼
+          ⚠ Signature Invalidated
+           Application must be
+           re-signed before use
+```
 
-Mode 1: ipaopt strip (Post-Build Pipeline)
-This mode targets an already built .ipa file. It focuses on removing loose, non-cataloged assets and thinning fat binaries.
+---
 
-Execution Flow:
-Plaintext
-      ┌────────────────────────────────────────┐
-      │               Target IPA               │
-      └───────────────────┬────────────────────┘
-                          │
-             [1] Extract & Inspect Bundle
-                          │
-         ┌────────────────┴────────────────┐
-         ▼                                 ▼
-   [Loose Resources]               [Mach-O Binaries]
-         │                                 │
-   [2] Match filename patterns       [3] Thin architectures
-       (e.g., `@2x~ipad.png`)            via `lipo` tool
-         │                                 │
-   [4] Purge matching files          [5] Replace fat binary
-         │                                 │
-         └────────────────┬────────────────┘
-                          │
-           [6] Repackage into `.ipa`
-                          │
-                          ▼
-      ┌────────────────────────────────────────┐
-      │         ⚠️ INVALIDATED SIGNATURE        │
-      │    Must re-sign before installation!   │
-      └────────────────────────────────────────┘
-Breakdown of Steps:
-Extraction: ipaopt unzips the .ipa container to inspect its contents.
+## Processing Steps
 
-Loose Resource Stripping: It scans the bundle directory structure for loose image assets. Using Apple's old-school naming conventions (eg ; ~ipad, @1x), it deletes files matching your --remove-idiom and --keep-scales rules.
+### 1. Extract Bundle
 
-Binary Thinning: It looks for compiled Mach-O executables and dynamic frameworks. It invokes the macOS lipo tool to strip out unneeded CPU architecture slices (like legacy 32-bit slices or simulator targets), keeping only what you specified (eg ; arm64).
+The IPA archive is unpacked so its application bundle can be inspected.
 
-Re-zipping: It bundles the modified payload back into a new .ipa.
+---
 
-🛑 Note: Modifying the contents of a compiled application bundle instantly breaks the cryptographic signature. The final .ipa must be re-signed before it can be side-loaded or submitted to Apple.
+### 2. Strip Loose Resources
 
-Mode 2: ipaopt catalog-filter (Pre-Build Pipeline)
-This mode targets the raw .xcassets source directory before Xcode compiles the project. It allows you to actually reduce the size of the final Assets.car binary.
+ipaopt scans for image files that are **not** stored inside `Assets.car`.
 
-Execution Flow:
-Plaintext
-      ┌────────────────────────────────────────┐
-      │         Raw .xcassets Folder           │
-      └───────────────────┬────────────────────┘
-                          │
-             [1] Deep-scan Directory Tree
-                          │
-         ┌────────────────┴────────────────┐
-         ▼                                 ▼
-   [Contents.JSON Files]            [Raw Asset Files]
-         │                                 │
-   [2] Parse and strip metadata      [3] Delete physical image
-       entries matching rules            files dropped from JSON
-         │                                 │
-         └────────────────┬────────────────┘
-                          │
-            [4] Write Filtered .xcassets
-                          │
-             Is `--compile` flag set?
-                    ├───► NO  ──► Stop (Output modified source)
-                    │
-                    └───► YES ──► [5] Invoke `actool` (macOS Only)
-                                         │
-                                         ▼
-                                ┌─────────────────┐
-                                │ Lean Assets.car │
-                                └─────────────────┘
-Breakdown of Steps:
-Metadata Parsing: ipaopt crawls your asset catalog directory. Every image set or data set has a Contents.Json file defining its variants (idioms, scales, appearances).
+Typical filename conventions include:
 
-JSON Pruning: The tool parses these JSON structures and removes array entries that conflict with your rules (eg ; dropping the dark mode dictionary entry or removing the iPad device target).
+- `@1x`
+- `@2x`
+- `@3x`
+- `~ipad`
+- `~iphone`
 
-File Cleanup: It compares the updated Contents.json files against the physical assets inside the folders, deleting any raw .png, .jpg, or .pdf files that are no longer referenced.
+Files matching the configured removal rules (`--remove-idiom`, `--keep-scales`, etc.) are deleted.
 
-Compilation (Optional): If --compile is enabled, ipaopt acts as a wrapper for Apple's actool. It passes the freshly optimized, lightweight .xcassets structure into the official compiler to output a pristine, space saving Assets.car binary.
+---
+
+### 3. Thin Mach-O Binaries
+
+Executables and embedded frameworks are inspected.
+
+Using Apple's `lipo` utility, unwanted CPU slices (for example `armv7` or simulator architectures) are removed while preserving only the requested architectures (such as `arm64`).
+
+---
+
+### 4. Repackage
+
+The modified application bundle is compressed back into a new `.ipa`.
+
+---
+
+## Signature Warning
+
+Any modification to an application bundle invalidates Apple's code signature.
+
+The resulting IPA **must be re-signed** before it can be:
+
+- installed on a device
+- sideloaded
+- distributed
+- submitted to Apple
+
+---
+
+# Mode 2 — `ipaopt catalog-filter`
+
+**Target:** Raw `.xcassets` directories
+
+Unlike `strip`, this mode works **before** compilation.
+
+Since the source assets are still editable, ipaopt can permanently reduce the size of the resulting `Assets.car`.
+
+---
+
+## Processing Pipeline
+
+```text
+             Raw .xcassets
+                   │
+                   ▼
+        Scan Asset Catalog Tree
+                   │
+        ┌──────────┴──────────┐
+        ▼                     ▼
+   Parse Contents.json    Read Image Files
+        │                     │
+        ▼                     ▼
+ Remove Metadata Entries Delete Unreferenced Assets
+        └──────────┬──────────┘
+                   ▼
+      Write Optimized Asset Catalog
+                   │
+          --compile specified?
+              │           │
+              │ No        │ Yes
+              ▼           ▼
+         Finished     Invoke actool
+                           │
+                           ▼
+                  Optimized Assets.car
+```
+
+---
+
+## Processing Steps
+
+### 1. Scan Asset Catalog
+
+ipaopt recursively walks the `.xcassets` directory tree.
+
+Every asset set is inspected, including:
+
+- Image Sets
+- App Icons
+- Data Sets
+- Color Sets
+- Symbol Sets
+
+---
+
+### 2. Parse Metadata
+
+Each asset set contains a `Contents.json` file describing available variants.
+
+Examples include:
+
+- device idiom
+- image scale
+- appearance
+- localization
+
+ipaopt parses these metadata files and removes entries that match the configured filters.
+
+Examples:
+
+- remove iPad variants
+- remove dark mode assets
+- remove unused scales
+
+---
+
+### 3. Remove Unreferenced Files
+
+After metadata has been updated, ipaopt compares the remaining JSON references against the physical files.
+
+Any orphaned assets are deleted automatically.
+
+Supported file types include:
+
+- PNG
+- JPEG
+- PDF
+- SVG (where applicable)
+
+---
+
+### 4. Write Filtered Catalog
+
+The optimized asset catalog is written back to disk.
+
+At this point the catalog remains fully editable and can still be opened in Xcode.
+
+---
+
+### 5. Optional Compilation
+
+When the `--compile` flag is provided, ipaopt invokes Apple's `actool` compiler.
+
+The optimized asset catalog is compiled into a smaller `Assets.car` using Apple's official build tools.
+
+---
+
+# Summary
+
+| Mode | Input | Output | Assets.car Modified |
+|------|-------|--------|---------------------|
+| `strip` | Built `.ipa` | Optimized `.ipa` | ✖ No |
+| `catalog-filter` | `.xcassets` | Filtered source or new `Assets.car` | ✓ Yes |
+
+---
+
+# Key Difference
+
+`strip` optimizes **compiled applications**.
+
+- Removes loose resources
+- Thins Mach-O binaries
+- Requires re-signing
+
+`catalog-filter` optimizes **source assets**.
+
+- Removes unwanted asset variants
+- Deletes unused files
+- Produces a smaller `Assets.car`
+- Preserves Apple's official asset compilation pipeline
