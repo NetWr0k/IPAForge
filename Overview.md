@@ -229,7 +229,7 @@ The optimized asset catalog is compiled into a smaller `Assets.car` using Apple'
 | Mode | Input | Output | Assets.car Modified |
 |------|-------|--------|---------------------|
 | `strip` | Built `.ipa` | Optimized `.ipa` | ✖ No |
-| `catalog-filter` | `.xcassets` | Filtered source or new `Assets.car` | ✓ Yes |
+| `catalog-filter` | `.xcassets` | Filtered source or new `Assets.car` | ✔ Yes |
 
 ---
 
